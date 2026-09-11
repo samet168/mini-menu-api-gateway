@@ -43,9 +43,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from app.billing_router import router as billing_router
+from app.integrations_router import router as integrations_router
+from app.notifications_router import router as notifications_router
+
 # Attach Middlewares
 setup_cors(app)
 app.add_middleware(CorrelationIdMiddleware)
+
+# Include Routers
+app.include_router(billing_router)
+app.include_router(integrations_router)
+app.include_router(notifications_router)
 
 
 # ==============================================================================

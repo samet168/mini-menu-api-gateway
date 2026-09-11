@@ -2,7 +2,7 @@ import logging
 from typing import AsyncGenerator, Optional
 from urllib.parse import urljoin
 from fastapi import HTTPException, Request, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 import httpx
 
 logger = logging.getLogger("gateway.reverse_proxy")
@@ -17,7 +17,7 @@ HOP_BY_HOP_HEADERS = {
     "trailers",
     "transfer-encoding",
     "upgrade",
-    "content-length",  # Recalculated by streaming transport
+    "content-length",  # Recalculated by response
 }
 
 
@@ -59,8 +59,8 @@ async def proxy_request(
     timeout: float = 60.0,
 ) -> Response:
     """
-    Streams and forwards an incoming HTTP request to the designated downstream microservice.
-    Supports all HTTP verbs and streaming multipart/form-data uploads.
+    Forwards an incoming HTTP request to the designated downstream microservice.
+    Reads complete payload to prevent socket truncation on client exit.
     """
     # Build complete destination URL
     dest_url = f"{target_base_url.rstrip('/')}/{target_path.lstrip('/')}"
@@ -70,59 +70,49 @@ async def proxy_request(
 
     clean_headers = _clean_proxy_headers(request, correlation_id)
 
-    async def _forward() -> Response:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            try:
-                # Prepare streaming request
-                req_stream = stream_request_body(request)
-                upstream_req = client.build_request(
-                    method=request.method,
-                    url=dest_url,
-                    headers=clean_headers,
-                    content=req_stream,
-                )
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        try:
+            req_body = await request.body()
+            upstream_req = client.build_request(
+                method=request.method,
+                url=dest_url,
+                headers=clean_headers,
+                content=req_body,
+            )
 
-                upstream_resp = await client.send(upstream_req, stream=True)
+            upstream_resp = await client.send(upstream_req)
+            content = await upstream_resp.aread()
 
-                # Filter response headers
-                response_headers = {}
-                for k, v in upstream_resp.headers.items():
-                    if k.lower() not in HOP_BY_HOP_HEADERS:
-                        response_headers[k] = v
-                response_headers["X-Correlation-ID"] = correlation_id
+            # Filter response headers
+            response_headers = {}
+            for k, v in upstream_resp.headers.items():
+                if k.lower() not in HOP_BY_HOP_HEADERS:
+                    response_headers[k] = v
+            response_headers["X-Correlation-ID"] = correlation_id
+            response_headers["Content-Length"] = str(len(content))
 
-                # Stream response back to client
-                async def response_streamer() -> AsyncGenerator[bytes, None]:
-                    try:
-                        async for chunk in upstream_resp.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await upstream_resp.aclose()
+            return Response(
+                content=content,
+                status_code=upstream_resp.status_code,
+                headers=response_headers,
+                media_type=upstream_resp.headers.get("content-type"),
+            )
 
-                return StreamingResponse(
-                    content=response_streamer(),
-                    status_code=upstream_resp.status_code,
-                    headers=response_headers,
-                    media_type=upstream_resp.headers.get("content-type"),
-                )
-
-            except httpx.ConnectError as exc:
-                logger.error(f"Failed to connect to downstream service at {dest_url}: {exc}")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"Downstream service unavailable at {target_base_url}. Please try again shortly.",
-                )
-            except httpx.TimeoutException as exc:
-                logger.error(f"Downstream service timeout for {dest_url}: {exc}")
-                raise HTTPException(
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                    detail="Gateway timed out waiting for downstream service response.",
-                )
-            except Exception as exc:
-                logger.exception(f"Unexpected error proxying to {dest_url}: {exc}")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Bad Gateway: Error communicating with downstream service: {str(exc)}",
-                )
-
-    return await _forward()
+        except httpx.ConnectError as exc:
+            logger.error(f"Failed to connect to downstream service at {dest_url}: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Downstream service unavailable at {target_base_url}. Please try again shortly.",
+            )
+        except httpx.TimeoutException as exc:
+            logger.error(f"Downstream service timeout for {dest_url}: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Gateway timed out waiting for downstream service response.",
+            )
+        except Exception as exc:
+            logger.exception(f"Unexpected error proxying to {dest_url}: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Bad Gateway: Error communicating with downstream service: {str(exc)}",
+            )
